@@ -106,6 +106,7 @@ static void             add_legacy_layer_effects   (GimpLayer      *layer,
                                                     PSDimage       *img_a);
 
 static void             add_adjustment_layer       (GimpLayer      *layer,
+                                                    PSDimage       *img_a,
                                                     PSDlayer       *lyr_a);
 static void             add_layer_effects          (GimpLayer      *layer,
                                                     PSDlayer       *lyr_a,
@@ -2966,7 +2967,7 @@ add_layers (GimpImage     *image,
 
           gimp_layer_set_mode (layer, GIMP_LAYER_MODE_PASS_THROUGH);
 
-          add_adjustment_layer (layer, lyr_a[lidx]);
+          add_adjustment_layer (layer, img_a, lyr_a[lidx]);
         }
       else if (lyr_a[lidx]->group_type != 0)
         {
@@ -3377,6 +3378,8 @@ add_layers (GimpImage     *image,
 
       g_free (lyr_a[lidx]->chn_info);
       g_free (lyr_a[lidx]->name);
+      g_free (lyr_a[lidx]->adjustment_layer->gradient_locations);
+      g_free (lyr_a[lidx]->adjustment_layer->gradient_colors);
       g_free (lyr_a[lidx]->adjustment_layer);
       g_free (lyr_a[lidx]->layer_styles);
       g_free (lyr_a[lidx]->layer_effects.effects);
@@ -3586,6 +3589,7 @@ add_legacy_layer_effects (GimpLayer *layer,
 
 static void
 add_adjustment_layer (GimpLayer *layer,
+                      PSDimage  *img_a,
                       PSDlayer  *lyr_a)
 {
   GimpDrawableFilter *filter = NULL;
@@ -3816,6 +3820,163 @@ add_adjustment_layer (GimpLayer *layer,
                                                 "low",     ladj->level / 255.0f,
                                                 "channel", GIMP_HISTOGRAM_LUMINANCE,
                                                 NULL);
+    }
+  else if (memcmp (ladj->type, PSD_LADJ_EXPOSURE, 4) == 0)
+    {
+      /* Photoshop computes (in * 2^exposure + offset) ^ (1 / gamma) in
+       * linear light; GEGL's exposure and levels ops and GIMP's levels in
+       * linear TRC all work on linear RGB, so we chain them in the same order. */
+      filter = gimp_drawable_append_new_filter (GIMP_DRAWABLE (layer),
+                                                "gegl:exposure",
+                                                NULL,
+                                                GIMP_LAYER_MODE_REPLACE,
+                                                1.0,
+                                                "exposure", (gdouble) ladj->exposure,
+                                                NULL);
+
+      if (ladj->exposure_offset != 0.0f)
+        {
+          g_object_unref (filter);
+          filter = gimp_drawable_append_new_filter (GIMP_DRAWABLE (layer),
+                                                    "gegl:levels",
+                                                    NULL,
+                                                    GIMP_LAYER_MODE_REPLACE,
+                                                    1.0,
+                                                    "out-low",  (gdouble) ladj->exposure_offset,
+                                                    "out-high", 1.0 + ladj->exposure_offset,
+                                                    NULL);
+        }
+
+      if (ladj->exposure_gamma > 0.0f && ladj->exposure_gamma != 1.0f)
+        {
+          GimpDrawableFilterConfig *config;
+
+          g_object_unref (filter);
+          filter = gimp_drawable_append_new_filter (GIMP_DRAWABLE (layer),
+                                                    "gimp:levels",
+                                                    NULL,
+                                                    GIMP_LAYER_MODE_REPLACE,
+                                                    1.0,
+                                                    NULL);
+
+          config = gimp_drawable_filter_get_config (filter);
+          g_object_set (config, "channel", GIMP_HISTOGRAM_VALUE, NULL);
+          gimp_drawable_filter_update (filter);
+          g_object_set (config,
+                        "trc",   GIMP_TRC_LINEAR,
+                        "gamma", (gdouble) ladj->exposure_gamma,
+                        NULL);
+          gimp_drawable_filter_update (filter);
+        }
+    }
+  else if (memcmp (ladj->type, PSD_LADJ_PHOTO_FILT, 4) == 0)
+    {
+      const Babl    *format = gimp_drawable_get_format (GIMP_DRAWABLE (layer));
+      const Babl    *space  = babl_format_get_space (format);
+      GeglColor     *color  = gegl_color_new (NULL);
+      GimpLayerMode  mode;
+
+      if (ladj->filter_is_lab)
+        gegl_color_set_pixel (color, babl_format ("CIE Lab double"),
+                              ladj->filter_lab);
+      else
+        convert_legacy_psd_color (color, ladj->filter_color, space,
+                                  img_a->ibm_pc_format);
+
+      /* A photo filter tints the image with a solid color at the given
+       * density. "Preserve Luminosity" keeps the original lightness,
+       * which matches GIMP's LCH Color mode; otherwise the tint darkens
+       * the image like a colored lens, i.e. Multiply. */
+      mode = ladj->preserve_luminosity ? GIMP_LAYER_MODE_LCH_COLOR :
+                                         GIMP_LAYER_MODE_MULTIPLY;
+
+      filter = gimp_drawable_append_new_filter (GIMP_DRAWABLE (layer),
+                                                "gegl:color-overlay",
+                                                NULL,
+                                                mode,
+                                                CLAMP (ladj->filter_density / 100.0, 0.0, 1.0),
+                                                "value", color,
+                                                NULL);
+      g_object_unref (color);
+    }
+  else if (memcmp (ladj->type, PSD_LADJ_GRAD_MAP, 4) == 0)
+    {
+      const Babl               *format = gimp_drawable_get_format (GIMP_DRAWABLE (layer));
+      const Babl               *space  = babl_format_get_space (format);
+      GimpDrawableFilterConfig *config;
+      GimpCurve                *curves[3];
+
+      /* A gradient map replaces each pixel's luminance with the gradient
+       * color at that position. We build this from a luminance desaturate
+       * followed by piecewise-linear R, G and B curves through the stops. */
+      g_object_unref (gimp_drawable_append_new_filter (GIMP_DRAWABLE (layer),
+                                                       "gimp:desaturate",
+                                                       NULL,
+                                                       GIMP_LAYER_MODE_REPLACE,
+                                                       1.0,
+                                                       "mode", GIMP_DESATURATE_LUMINANCE,
+                                                       NULL));
+
+      for (gint c = 0; c < 3; c++)
+        curves[c] = gimp_curve_new ();
+
+      for (gint i = 0; i < ladj->n_gradient_stops; i++)
+        {
+          GeglColor *color = gegl_color_new (NULL);
+          gdouble    rgb[3];
+          gdouble    x     = ladj->gradient_locations[i];
+
+          if (ladj->gradient_reversed)
+            x = 1.0 - x;
+
+          convert_legacy_psd_color (color, ladj->gradient_colors[i], space,
+                                    img_a->ibm_pc_format);
+          gegl_color_get_pixel (color, babl_format_with_space ("R'G'B' double", space),
+                                rgb);
+          g_object_unref (color);
+
+          for (gint c = 0; c < 3; c++)
+            {
+              gint point;
+
+              /* Extend the first and last stops to the ends of the range */
+              if (i == 0)
+                gimp_curve_set_point_type (curves[c],
+                                           gimp_curve_add_point (curves[c],
+                                                                 ladj->gradient_reversed ? 1.0 : 0.0,
+                                                                 rgb[c]),
+                                           GIMP_CURVE_POINT_CORNER);
+              if (i == ladj->n_gradient_stops - 1)
+                gimp_curve_set_point_type (curves[c],
+                                           gimp_curve_add_point (curves[c],
+                                                                 ladj->gradient_reversed ? 0.0 : 1.0,
+                                                                 rgb[c]),
+                                           GIMP_CURVE_POINT_CORNER);
+
+              point = gimp_curve_add_point (curves[c], x, rgb[c]);
+              gimp_curve_set_point_type (curves[c], point,
+                                         GIMP_CURVE_POINT_CORNER);
+            }
+        }
+
+      filter = gimp_drawable_append_new_filter (GIMP_DRAWABLE (layer),
+                                                "gimp:curves",
+                                                NULL,
+                                                GIMP_LAYER_MODE_REPLACE,
+                                                1.0, NULL);
+      config = gimp_drawable_filter_get_config (filter);
+
+      for (gint c = 2; c >= 0; c--)
+        {
+          g_object_set (config, "channel", GIMP_HISTOGRAM_RED + c, NULL);
+          gimp_drawable_filter_update (filter);
+          g_object_set (config,
+                        "trc",   GIMP_TRC_PERCEPTUAL,
+                        "curve", curves[c],
+                        NULL);
+          gimp_drawable_filter_update (filter);
+          g_object_unref (curves[c]);
+        }
     }
   /* Fill layers */
   else if (memcmp (ladj->type, PSD_LFIL_SOLID, 4) == 0)
