@@ -32,9 +32,9 @@
   PSD_LADJ_HUE2           "hue2"    Empty Layer  * Adjustment layer - hue saturation (PS5) *
   PSD_LADJ_SELECTIVE      "selc"    Empty Layer  * Adjustment layer - selective color (PS4) *
   PSD_LADJ_MIXER          "mixr"    Empty Layer  * Adjustment layer - channel mixer (PS9) *
-  PSD_LADJ_GRAD_MAP       "grdm"    Empty Layer  * Adjustment layer - gradient map (PS9) *
-  PSD_LADJ_PHOTO_FILT     "phfl"    Empty Layer  * Adjustment layer - photo filter (PS9) *
-  PSD_LADJ_EXPOSURE       "expA"    Empty Layer  * Adjustment layer - exposure (PS10) *
+  PSD_LADJ_GRAD_MAP       "grdm"    Loaded       * Adjustment layer - gradient map (PS9) *
+  PSD_LADJ_PHOTO_FILT     "phfl"    Loaded       * Adjustment layer - photo filter (PS9) *
+  PSD_LADJ_EXPOSURE       "expA"    Loaded       * Adjustment layer - exposure (PS10) *
   PSD_LADJ_INVERT         "nvrt"    Empty Layer  * Adjustment layer - invert (PS4) *
   PSD_LADJ_THRESHOLD      "thrs"    Empty Layer  * Adjustment layer - threshold (PS4) *
   PSD_LADJ_POSTERIZE      "post"    Empty Layer  * Adjustment layer - posterize (PS4) *
@@ -358,10 +358,7 @@ load_layer_resource (PSDlayerres   *res_a,
 
   /* Process layer resource blocks */
   if (memcmp (res_a->key, PSD_LADJ_BLACK_WHITE, 4) == 0 ||
-      memcmp (res_a->key, PSD_LADJ_SELECTIVE, 4) == 0   ||
-      memcmp (res_a->key, PSD_LADJ_GRAD_MAP, 4) == 0    ||
-      memcmp (res_a->key, PSD_LADJ_PHOTO_FILT, 4) == 0  ||
-      memcmp (res_a->key, PSD_LADJ_EXPOSURE, 4) == 0)
+      memcmp (res_a->key, PSD_LADJ_SELECTIVE, 4) == 0)
     {
       if (lyr_a)
         {
@@ -381,9 +378,18 @@ load_layer_resource (PSDlayerres   *res_a,
            memcmp (res_a->key, PSD_LADJ_MIXER, 4) == 0      ||
            memcmp (res_a->key, PSD_LADJ_INVERT, 4) == 0     ||
            memcmp (res_a->key, PSD_LADJ_POSTERIZE, 4) == 0  ||
-           memcmp (res_a->key, PSD_LADJ_THRESHOLD, 4) == 0)
+           memcmp (res_a->key, PSD_LADJ_THRESHOLD, 4) == 0  ||
+           memcmp (res_a->key, PSD_LADJ_EXPOSURE, 4) == 0   ||
+           memcmp (res_a->key, PSD_LADJ_PHOTO_FILT, 4) == 0 ||
+           memcmp (res_a->key, PSD_LADJ_GRAD_MAP, 4) == 0)
     {
       load_resource_ladj (res_a, lyr_a, input, error);
+
+      if (lyr_a && ! strlen (lyr_a->adjustment_layer->type))
+        {
+          lyr_a->unsupported_features->adjustment_layer = TRUE;
+          lyr_a->unsupported_features->show_gui         = TRUE;
+        }
     }
 
   else if (memcmp (res_a->key, PSD_LFIL_SOLID, 4) == 0   ||
@@ -902,6 +908,169 @@ load_resource_ladj (const PSDlayerres  *res_a,
           return -1;
         }
       lyr_a->adjustment_layer->level = levels;
+    }
+  else if (memcmp (res_a->key, PSD_LADJ_EXPOSURE, 4) == 0)
+    {
+      guint32 values[3];
+
+      if (! psd_read_int16 (input, &lyr_a->adjustment_layer->version,
+                            res_a->ibm_pc_format, error)                     ||
+          ! psd_read_uint32 (input, &values[0], res_a->ibm_pc_format, error) ||
+          ! psd_read_uint32 (input, &values[1], res_a->ibm_pc_format, error) ||
+          ! psd_read_uint32 (input, &values[2], res_a->ibm_pc_format, error))
+        {
+          psd_set_error (error);
+          return -1;
+        }
+
+      /* Exposure, offset and gamma are stored as 32-bit IEEE floats */
+      memcpy (&lyr_a->adjustment_layer->exposure,        &values[0], 4);
+      memcpy (&lyr_a->adjustment_layer->exposure_offset, &values[1], 4);
+      memcpy (&lyr_a->adjustment_layer->exposure_gamma,  &values[2], 4);
+
+      if (isfinite (lyr_a->adjustment_layer->exposure)        &&
+          isfinite (lyr_a->adjustment_layer->exposure_offset) &&
+          isfinite (lyr_a->adjustment_layer->exposure_gamma))
+        memcpy (lyr_a->adjustment_layer->type, PSD_LADJ_EXPOSURE, 4);
+    }
+  else if (memcmp (res_a->key, PSD_LADJ_PHOTO_FILT, 4) == 0)
+    {
+      guint16 version = 0;
+      guchar  preserve_luminosity = 0;
+
+      if (! psd_read_uint16 (input, &version, res_a->ibm_pc_format, error))
+        {
+          psd_set_error (error);
+          return -1;
+        }
+
+      lyr_a->adjustment_layer->version = version;
+
+      if (version == 3)
+        {
+          /* Version 3 stores the filter color as L*a*b* values * 100 */
+          for (gint i = 0; i < 3; i++)
+            {
+              gint32 value = 0;
+
+              if (! psd_read_int32 (input, &value, res_a->ibm_pc_format, error))
+                {
+                  psd_set_error (error);
+                  return -1;
+                }
+              lyr_a->adjustment_layer->filter_lab[i] = value / 100.0;
+            }
+          lyr_a->adjustment_layer->filter_is_lab = TRUE;
+        }
+      else if (version == 2)
+        {
+          if (psd_read (input, lyr_a->adjustment_layer->filter_color, 10,
+                        error) < 10)
+            {
+              psd_set_error (error);
+              return -1;
+            }
+        }
+      else
+        {
+          IFDBG(1) g_debug ("Unsupported photo filter version: %u", version);
+          return 0;
+        }
+
+      if (! psd_read_uint32 (input, &lyr_a->adjustment_layer->filter_density,
+                             res_a->ibm_pc_format, error) ||
+          psd_read (input, &preserve_luminosity, 1, error) < 1)
+        {
+          psd_set_error (error);
+          return -1;
+        }
+
+      lyr_a->adjustment_layer->preserve_luminosity = (preserve_luminosity != 0);
+      memcpy (lyr_a->adjustment_layer->type, PSD_LADJ_PHOTO_FILT, 4);
+    }
+  else if (memcmp (res_a->key, PSD_LADJ_GRAD_MAP, 4) == 0)
+    {
+      guint16  version     = 0;
+      guchar   is_reversed = 0;
+      guchar   is_dithered = 0;
+      guint16  n_stops     = 0;
+      gchar   *name;
+      gint32   bread;
+      gint32   bwritten;
+
+      if (! psd_read_uint16 (input, &version, res_a->ibm_pc_format, error) ||
+          psd_read (input, &is_reversed, 1, error) < 1                     ||
+          psd_read (input, &is_dithered, 1, error) < 1)
+        {
+          psd_set_error (error);
+          return -1;
+        }
+
+      if (version != 1 && version != 3)
+        {
+          IFDBG(1) g_debug ("Unsupported gradient map version: %u", version);
+          return 0;
+        }
+
+      /* Version 3 adds a 4-byte interpolation method key */
+      if (version == 3)
+        {
+          gchar method[4];
+
+          if (psd_read (input, method, 4, error) < 4)
+            {
+              psd_set_error (error);
+              return -1;
+            }
+        }
+
+      name = fread_unicode_string (&bread, &bwritten, 1, res_a->ibm_pc_format,
+                                   input, error);
+      if (error && *error)
+        return -1;
+      g_free (name);
+
+      if (! psd_read_uint16 (input, &n_stops, res_a->ibm_pc_format, error))
+        {
+          psd_set_error (error);
+          return -1;
+        }
+
+      /* Each color stop takes 20 bytes */
+      if (n_stops == 0 || (guint64) n_stops * 20 > res_a->data_len)
+        {
+          IFDBG(1) g_debug ("Invalid gradient map stop count: %u", n_stops);
+          return 0;
+        }
+
+      lyr_a->adjustment_layer->version            = version;
+      lyr_a->adjustment_layer->gradient_reversed  = (is_reversed != 0);
+      lyr_a->adjustment_layer->gradient_locations = g_new0 (gdouble, n_stops);
+      lyr_a->adjustment_layer->gradient_colors    = g_malloc0_n (n_stops, 5 * sizeof (guint16));
+
+      for (gint i = 0; i < n_stops; i++)
+        {
+          guint32 location = 0;
+          guint32 midpoint = 0;
+          guint16 padding  = 0;
+
+          if (! psd_read_uint32 (input, &location, res_a->ibm_pc_format, error) ||
+              ! psd_read_uint32 (input, &midpoint, res_a->ibm_pc_format, error) ||
+              psd_read (input, lyr_a->adjustment_layer->gradient_colors[i], 10,
+                        error) < 10                                             ||
+              psd_read (input, &padding, 2, error) < 2)
+            {
+              psd_set_error (error);
+              return -1;
+            }
+
+          /* Stop locations range from 0 to 4096 */
+          lyr_a->adjustment_layer->gradient_locations[i] =
+            CLAMP (location / 4096.0, 0.0, 1.0);
+        }
+
+      lyr_a->adjustment_layer->n_gradient_stops = n_stops;
+      memcpy (lyr_a->adjustment_layer->type, PSD_LADJ_GRAD_MAP, 4);
     }
 
   return 0;

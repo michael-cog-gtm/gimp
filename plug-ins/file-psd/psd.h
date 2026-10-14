@@ -724,6 +724,20 @@ typedef struct
   GimpCurve *curve[4];            /* Curve */
   guint32    curve_count;
 
+  gfloat     exposure;            /* Exposure */
+  gfloat     exposure_offset;
+  gfloat     exposure_gamma;
+
+  gboolean   filter_is_lab;       /* Photo Filter */
+  guint16    filter_color[5];     /* Version 2: PSD color space + 4 components */
+  gdouble    filter_lab[3];       /* Version 3: L*a*b* */
+  guint32    filter_density;
+
+  guint16    n_gradient_stops;    /* Gradient Map */
+  gboolean   gradient_reversed;
+  gdouble   *gradient_locations;
+  guint16  (*gradient_colors)[5];
+
   JsonNode  *descriptor;
 
 } PSDAdjustmentLayer;
